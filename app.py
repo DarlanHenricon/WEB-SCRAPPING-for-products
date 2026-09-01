@@ -12,7 +12,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-import google.generativeai as genai
+from openai import OpenAI  # <-- troca do SDK google.generativeai pelo SDK OpenAI
 
 # ==========================================================
 # CONFIGURAÇÕES GERAIS
@@ -21,8 +21,11 @@ import google.generativeai as genai
 APP_TITLE = "Nescau — Consumer Insights"
 APP_SUBTITLE = "Como os consumidores percebem o produto?"
 
-# Modelo do Gemini. (Usando o 1.5 Flash por ser muito rápido e barato/grátis)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# Modelo do TeamoRouter (formato OpenAI-compatível).
+MODEL_NAME = os.getenv("TEAMO_MODEL", "deepseek-v4-pro-free")
+
+# Base URL do gateway TeamoRouter (o /v1 é OBRIGATÓRIO para o SDK OpenAI).
+TEAMO_BASE_URL = os.getenv("TEAMO_BASE_URL", "https://api.teamorouter.com/v1")
 
 # Tamanho do lote de comentários enviado por chamada de API.
 BATCH_SIZE = int(os.getenv("NESCAU_BATCH_SIZE", "40"))
@@ -77,7 +80,7 @@ def load_data(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
             if df.shape[1] >= 2:
                 df.columns = [str(c).strip().lower() for c in df.columns]
                 return df, None
-        except Exception as exc: 
+        except Exception as exc:
             last_error = str(exc)
             continue
 
@@ -202,7 +205,7 @@ def chunk_list(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 # ==========================================================
-# 5. PROMPTS DA IA (ADAPTADOS PARA GEMINI E CAMPANHAS)
+# 5. PROMPTS DA IA
 # ==========================================================
 
 SYSTEM_PROMPT = (
@@ -243,8 +246,8 @@ Retorne JSON no formato EXATO abaixo:
   "oportunidades": [{"tema": "", "problema": "", "oportunidade": "", "evidencia": ""}],
   "comportamento": {"recompra": "", "recomendacao": "", "fidelidade": "", "risco_abandono": ""},
   "marca": {
-    "percepcao": "Resumo de como veem a marca em si", 
-    "principais_pontos": ["Ponto 1"], 
+    "percepcao": "Resumo de como veem a marca em si",
+    "principais_pontos": ["Ponto 1"],
     "opiniao_publica_campanha": "Se houver menções a campanhas, comerciais ou propaganda, resuma a opinião pública geral sobre elas aqui. Diga se agradou ou não."
   },
   "insights": [{"titulo": "", "evidencia": "", "interpretacao": "", "importancia": ""}]
@@ -252,59 +255,83 @@ Retorne JSON no formato EXATO abaixo:
 """
 
 # ==========================================================
-# 6. CHAMAR A API DO GEMINI
+# 6. CHAMAR A API (TEAMOROUTER / DEEPSEEK — FORMATO OPENAI)
 # ==========================================================
 
 def get_api_key() -> Optional[str]:
-    if "GEMINI_API_KEY" in st.secrets:
-        return st.secrets["GEMINI_API_KEY"]
-    if "OPENAI_API_KEY" in st.secrets: # Fallback caso você chame assim no secrets
-        return st.secrets["OPENAI_API_KEY"]
-    return os.getenv("GEMINI_API_KEY", "").strip() or None
+    """Lê a chave do TeamoRouter (sk-teamo-...). Acesso a st.secrets é
+    protegido com try/except porque, se não existir arquivo secrets.toml,
+    o próprio acesso levanta exceção e derruba o app antes de qualquer chamada."""
+    for name in ("TEAMOROUTER_API_KEY", "TEAMO_API_KEY", "OPENAI_API_KEY"):
+        try:
+            if name in st.secrets:
+                val = str(st.secrets[name]).strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+    return os.getenv("TEAMOROUTER_API_KEY", "").strip() or None
 
-def _call_gemini_json(api_key: str, system_prompt: str, user_content: str) -> Dict[str, Any]:
-    genai.configure(api_key=api_key)
-    # Usando configuration do Gemini para forçar JSON output
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=system_prompt,
-        generation_config={"response_mime_type": "application/json", "temperature": 0.2}
-    )
-    
-    # Adicionando um pequeno delay para não estourar o limite de requisições do plano gratuito
-    time.sleep(1) 
-    
-    response = model.generate_content(user_content)
-    return safe_json_loads(response.text)
 
-@st.cache_data(show_spinner=False)
+def _build_client(api_key: str) -> OpenAI:
+    # O SDK OpenAI cuida do header Authorization: Bearer <key> exigido pelo gateway.
+    return OpenAI(base_url=TEAMO_BASE_URL, api_key=api_key)
+
+
+def _call_llm_json(api_key: str, system_prompt: str, user_content: str) -> Dict[str, Any]:
+    client = _build_client(api_key)
+
+    # Pequeno delay para respeitar o rate limit do plano free.
+    time.sleep(1)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    # Tenta forçar saída JSON nativa; se o modelo/gateway não suportar, refaz sem o parâmetro.
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+    except Exception:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.2,
+        )
+
+    return safe_json_loads(response.choices[0].message.content)
+
 def analyze_batches(api_key: str, comments: List[Dict[str, Any]], batch_size: int) -> Tuple[List[Dict[str, Any]], List[str]]:
     resultados: List[Dict[str, Any]] = []
     avisos: List[str] = []
 
     batches = chunk_list(comments, batch_size)
-    progress = st.progress(0.0, text="Interpretando comentários com o Gemini…")
+    progress = st.progress(0.0, text="Interpretando comentários com o DeepSeek…")
 
     for i, batch in enumerate(batches):
         payload = json.dumps(batch, ensure_ascii=False)
         user_content = BATCH_INSTRUCTION + "\n\nComentários:\n" + payload
         try:
-            data = _call_gemini_json(api_key, SYSTEM_PROMPT, user_content)
+            data = _call_llm_json(api_key, SYSTEM_PROMPT, user_content)
             lote_res = data.get("resultados", [])
             if isinstance(lote_res, list):
                 resultados.extend(lote_res)
             else:
                 avisos.append(f"Lote {i + 1}: formato inesperado, ignorado.")
-        except Exception as exc: 
+        except Exception as exc:
             avisos.append(f"Lote {i + 1}: falha na análise ({str(exc)}).")
-        progress.progress((i + 1) / len(batches), text="Interpretando comentários com o Gemini…")
+        progress.progress((i + 1) / len(batches), text="Interpretando comentários com o DeepSeek…")
 
     progress.empty()
     return resultados, avisos
 
-@st.cache_data(show_spinner=False)
 def synthesize_insights(
-    api_key: str, metrics: Dict[str, Any], aspect_agg: Dict[str, Any], 
+    api_key: str, metrics: Dict[str, Any], aspect_agg: Dict[str, Any],
     sentiment_counts: Dict[str, int], sample_comments: List[Dict[str, Any]], temporal_hint: str
 ) -> Dict[str, Any]:
     context = {
@@ -315,7 +342,7 @@ def synthesize_insights(
         "amostra_comentarios": sample_comments,
     }
     user_content = SYNTHESIS_INSTRUCTION + "\n\nDados de contexto (JSON):\n" + json.dumps(context, ensure_ascii=False)
-    return _call_gemini_json(api_key, SYSTEM_PROMPT, user_content)
+    return _call_llm_json(api_key, SYSTEM_PROMPT, user_content)
 
 def safe_json_loads(content: Optional[str]) -> Dict[str, Any]:
     if not content: raise ValueError("Resposta vazia da API.")
@@ -401,21 +428,19 @@ def validate_synthesis(data: Dict[str, Any]) -> Dict[str, Any]:
 # 8. DESIGN SYSTEM E GRÁFICOS (PLOTLY)
 # ==========================================================
 
-# Paleta com CONTRASTE FORTE (cores escuras/saturadas para leitura fácil dos dados).
 CHOCO_DARK = "#2A1208"
 CHOCO_SOFT = "#7A3E1D"
-GOLD       = "#C98A00"   # dourado mais escuro -> legível sobre fundo branco
-INK        = "#1C140F"   # tinta quase preta para textos e eixos
-POS_COLOR  = "#1B7A3D"   # verde escuro (positivo)
-NEG_COLOR  = "#C0261A"   # vermelho escuro (negativo)
-NEU_COLOR  = "#5C534C"   # cinza escuro (neutro) -> antes era claro demais
-MIS_COLOR  = "#B26A00"   # âmbar escuro (misto)
+GOLD       = "#C98A00"
+INK        = "#1C140F"
+POS_COLOR  = "#1B7A3D"
+NEG_COLOR  = "#C0261A"
+NEU_COLOR  = "#5C534C"
+MIS_COLOR  = "#B26A00"
 
 def inject_design_system() -> None:
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Montserrat:wght@700;800;900&display=swap');
-    /* Tinta escura em todo o app para MÁXIMO CONTRASTE */
     :root { --choco:#241006; --choco-2:#3A1A0D; --gold:#B87E00; --cream:#FFF7E7; --ink:#171009; }
     html, body, [class*="css"] { font-family:'Manrope',sans-serif; font-size:17px; }
     .stApp { background: radial-gradient(circle at 95% 2%, rgba(245,184,0,.10), transparent 26%), #FFFCF6; color:var(--ink); }
@@ -426,13 +451,11 @@ def inject_design_system() -> None:
     h1,h2,h3 { font-family:'Montserrat',sans-serif !important; letter-spacing:-.03em; }
     h2 { color:var(--choco) !important; }
 
-    /* Uploader e sidebar com texto forte */
     [data-testid="stFileUploader"] { background:#fff; border:2px dashed rgba(58,26,13,.45); border-radius:22px; padding:1rem; box-shadow:0 12px 35px rgba(63,33,19,.10); }
     [data-testid="stFileUploader"] label, [data-testid="stFileUploader"] p, [data-testid="stFileUploader"] span { color:#241006 !important; font-weight:600; font-size:1.02rem; }
     section[data-testid="stSidebar"] { background:#2A1208; }
     section[data-testid="stSidebar"] * { color:#FFF7E7 !important; }
 
-    /* Métricas nativas do Streamlit */
     div[data-testid="stMetric"] { background:white; border:1px solid rgba(58,26,13,.14); border-radius:22px; padding:1.15rem 1.2rem; box-shadow:0 12px 30px rgba(63,33,19,.10); }
     div[data-testid="stMetricLabel"] { color:#3A2A20; font-weight:800; font-size:1rem; }
     div[data-testid="stMetricValue"] { color:var(--choco); font-family:'Montserrat',sans-serif; font-size:2.4rem; font-weight:900; }
@@ -451,7 +474,6 @@ def inject_design_system() -> None:
     .section-title { margin:.15rem 0 0; color:#241006; font-family:'Montserrat',sans-serif; font-size:2.1rem; font-weight:900; }
     .section-copy { color:#4A382E; font-size:1.02rem; font-weight:500; max-width:38ch; text-align:right; }
 
-    /* KPI cards — rótulos e valores com forte contraste */
     .kpi-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:1rem; margin:.2rem 0 1.2rem; }
     .kpi { background:#fff; border-radius:24px; padding:1.35rem 1.3rem; box-shadow:0 14px 36px rgba(63,33,19,.10); border:1px solid rgba(58,26,13,.10); }
     .kpi-label { color:#3A2A20; font-size:.95rem; text-transform:uppercase; font-weight:900; letter-spacing:.03em; }
@@ -484,15 +506,12 @@ def style_figure(fig: go.Figure, height: int = 440) -> go.Figure:
     """Aplica tipografia grande e de alto contraste em todos os gráficos."""
     fig.update_layout(
         template="plotly_white", height=height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        # Fonte base MAIOR e escura para leitura fácil dos números
         font=dict(family="Manrope", color=INK, size=17),
         title=dict(font=dict(family="Montserrat", color=CHOCO_DARK, size=24), x=0.02, xanchor="left"),
         margin=dict(l=42, r=28, t=84, b=52),
         legend=dict(font=dict(size=16, color=INK), bgcolor="rgba(255,255,255,.65)"),
-        # Rótulos de dados sempre visíveis e nunca encolhidos automaticamente
         uniformtext=dict(minsize=15, mode="show"),
     )
-    # Eixos com linhas e números de alto contraste
     fig.update_xaxes(
         tickfont=dict(size=16, color=INK), title_font=dict(size=17, color=INK),
         showline=True, linecolor="rgba(28,20,15,.35)", gridcolor="rgba(28,20,15,.10)"
@@ -506,7 +525,6 @@ def style_figure(fig: go.Figure, height: int = 440) -> go.Figure:
 def chart_rating_distribution(metrics: Dict[str, Any]) -> go.Figure:
     notas=list(range(1,6)); valores=[metrics["distribuicao"].get(n,0) for n in notas]
     pct=[metrics["percentual"].get(n,0) for n in notas]
-    # Escala 1->5 do vermelho escuro ao verde escuro (todas escuras = alto contraste no branco)
     cores=["#B0241A","#C56A12","#B78A00","#3F8F3A","#166B2E"]
     rotulos=[f"<b>{v}</b><br>{p:.0f}%" for v, p in zip(valores, pct)]
     fig=go.Figure(go.Bar(
@@ -641,8 +659,19 @@ def run_ai_analysis(api_key: str, df: pd.DataFrame, metrics: Dict[str, Any]) -> 
     if not comments: return None
 
     comment_results, avisos = analyze_batches(api_key, comments, BATCH_SIZE)
+
+    # Mostra os avisos/erros de lote para não falhar silenciosamente.
+    if avisos:
+        with st.expander(f"⚠️ {len(avisos)} aviso(s) durante a análise dos lotes"):
+            for a in avisos:
+                st.write("• " + a)
+
     if not comment_results:
-        st.error("Falha ao processar com a IA. Verifique sua GEMINI_API_KEY e o limite de uso.")
+        st.error(
+            "Falha ao processar com a IA. Verifique: (1) sua TEAMOROUTER_API_KEY (deve começar com "
+            "'sk-teamo-'); (2) se o modelo 'deepseek-v4-pro-free' está disponível em GET /v1/models; "
+            "(3) o limite de uso do plano free (rate limit)."
+        )
         return None
 
     agg = aggregate_batch_results(df, comment_results)
@@ -651,7 +680,7 @@ def run_ai_analysis(api_key: str, df: pd.DataFrame, metrics: Dict[str, Any]) -> 
     if ts is not None and len(ts) >= 2:
         temporal_hint = f"Média inicial {ts['media_nota'].iloc[0]}, final {ts['media_nota'].iloc[-1]}."
 
-    sample = comments[:80] # Ajustado para não estourar o limite de tokens da API Flash free
+    sample = comments[:80]
 
     try:
         raw_synthesis = synthesize_insights(api_key, metrics, {"aspectos": agg["aspectos"][:15]}, agg["sentiment_counts"], sample, temporal_hint)
@@ -664,12 +693,13 @@ def run_ai_analysis(api_key: str, df: pd.DataFrame, metrics: Dict[str, Any]) -> 
 
 def main() -> None:
     inject_design_system()
-    st.markdown("""<div class="hero"><div class="hero-kicker">Consumer analytics · AI Gemini</div><h1>Consumer Insights — Nescau</h1><p>Extração automática de pontos fortes, fracos e opinião sobre campanhas de marketing.</p></div>""",unsafe_allow_html=True)
-    
+    st.markdown("""<div class="hero"><div class="hero-kicker">Consumer analytics · AI DeepSeek</div><h1>Consumer Insights — Nescau</h1><p>Extração automática de pontos fortes, fracos e opinião sobre campanhas de marketing.</p></div>""",unsafe_allow_html=True)
+
     with st.sidebar:
         st.header("⚙️ Configurações IA")
-        user_api_key = st.text_input("Cole aqui sua Gemini API Key:", type="password", help="Pegue gratuitamente no Google AI Studio")
-    
+        user_api_key = st.text_input("Cole aqui sua TeamoRouter API Key (sk-teamo-...):", type="password", help="Chave do gateway TeamoRouter")
+        st.caption(f"Modelo: `{MODEL_NAME}`")
+
     api_key = user_api_key or get_api_key()
 
     uploaded=st.file_uploader("Envie o CSV (data, 1-5, comentario)",type=["csv"])
@@ -678,35 +708,35 @@ def main() -> None:
     df_raw,load_err=load_data(uploaded)
     if load_err: st.error(load_err); return
     df, quality = clean_dataframe(df_raw)
-    
+
     metrics = compute_metrics(df)
     section_header("Visão geral","O pulso da experiência")
     render_top_metrics(metrics, {})
 
     c1,c2=st.columns([1,1.45])
     with c1: st.plotly_chart(chart_rating_distribution(metrics),use_container_width=True)
-    with c2: 
+    with c2:
         ts = build_time_series(df)
         if ts is not None: st.plotly_chart(chart_time_evolution(ts),use_container_width=True)
 
     st.markdown('<div class="ai-shell"><div class="ai-inner"><div class="ai-title" style="color:#FFFFFF;">AI Consumer Insights</div><p class="ai-copy">Organiza e descobre o que os clientes acharam do produto e das campanhas.</p></div></div>',unsafe_allow_html=True)
-    
+
     if not api_key:
-        st.error("👈 Por favor, cole sua chave do Gemini no menu lateral para liberar as funções da IA.")
+        st.error("👈 Por favor, cole sua chave do TeamoRouter no menu lateral para liberar as funções da IA.")
         return
 
-    if not st.button("Gerar análise inteligente com Gemini 🚀",use_container_width=False): return
+    if not st.button("Gerar análise inteligente com DeepSeek 🚀",use_container_width=False): return
 
-    with st.spinner("Analisando com Inteligência Artificial do Google..."):
+    with st.spinner("Analisando com Inteligência Artificial (DeepSeek via TeamoRouter)..."):
         result=run_ai_analysis(api_key,df,metrics)
     if result is None: return
-    
+
     synthesis=result["synthesis"]; agg=result["aggregation"]; sentiment_counts=agg["sentiment_counts"]; aspectos=synthesis.get("aspectos") or agg["aspectos"]
 
     section_header("Sentimento dos consumidores","Como a percepção se distribui")
     a,b=st.columns([.85,1.35])
     with a: st.plotly_chart(chart_sentiment_distribution(sentiment_counts),use_container_width=True)
-    with b: 
+    with b:
         fig=chart_diverging_aspects(aspectos)
         if fig: st.plotly_chart(fig,use_container_width=True)
 
