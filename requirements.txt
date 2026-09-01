@@ -1,5 +1,1 @@
-streamlit>=1.32
-pandas>=2.0
-plotly>=5.18
-openai>=1.30
-google-generativeai>=0.8
+streamlit>=1.32 pandas>=2.0 plotly>=5.18 openai>=1.30
