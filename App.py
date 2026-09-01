@@ -12,7 +12,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from openai import OpenAI  # <-- troca do SDK google.generativeai pelo SDK OpenAI
+from google import genai            # SDK NOVO (google-genai) — substitui o legado google.generativeai
+from google.genai import types
 
 # ==========================================================
 # CONFIGURAÇÕES GERAIS
@@ -21,11 +22,8 @@ from openai import OpenAI  # <-- troca do SDK google.generativeai pelo SDK OpenA
 APP_TITLE = "Nescau — Consumer Insights"
 APP_SUBTITLE = "Como os consumidores percebem o produto?"
 
-# Modelo do TeamoRouter (formato OpenAI-compatível).
-MODEL_NAME = os.getenv("TEAMO_MODEL", "deepseek-v4-pro-free")
-
-# Base URL do gateway TeamoRouter (o /v1 é OBRIGATÓRIO para o SDK OpenAI).
-TEAMO_BASE_URL = os.getenv("TEAMO_BASE_URL", "https://api.teamorouter.com/v1")
+# Modelo do Gemini ATIVO. (gemini-1.5-flash foi DESATIVADO em set/2025 -> use 2.5)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Tamanho do lote de comentários enviado por chamada de API.
 BATCH_SIZE = int(os.getenv("NESCAU_BATCH_SIZE", "40"))
@@ -190,7 +188,8 @@ def prepare_comments(df: pd.DataFrame) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     for idx, row in df.iterrows():
         texto = str(row[COL_COMENTARIO]).strip()
-        if not texto: continue
+        if not texto:
+            continue
         if len(texto) > MAX_COMMENT_CHARS:
             texto = texto[:MAX_COMMENT_CHARS] + "…"
         nota = row[COL_NOTA]
@@ -255,14 +254,13 @@ Retorne JSON no formato EXATO abaixo:
 """
 
 # ==========================================================
-# 6. CHAMAR A API (TEAMOROUTER / DEEPSEEK — FORMATO OPENAI)
+# 6. CHAMAR A API DO GEMINI (SDK NOVO: google-genai)
 # ==========================================================
 
 def get_api_key() -> Optional[str]:
-    """Lê a chave do TeamoRouter (sk-teamo-...). Acesso a st.secrets é
-    protegido com try/except porque, se não existir arquivo secrets.toml,
-    o próprio acesso levanta exceção e derruba o app antes de qualquer chamada."""
-    for name in ("TEAMOROUTER_API_KEY", "TEAMO_API_KEY", "OPENAI_API_KEY"):
+    """Lê a GEMINI_API_KEY. Acesso a st.secrets protegido com try/except,
+    porque, sem arquivo secrets.toml, o próprio acesso levanta exceção."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
         try:
             if name in st.secrets:
                 val = str(st.secrets[name]).strip()
@@ -270,54 +268,38 @@ def get_api_key() -> Optional[str]:
                     return val
         except Exception:
             pass
-    return os.getenv("TEAMOROUTER_API_KEY", "").strip() or None
+    return os.getenv("GEMINI_API_KEY", "").strip() or None
 
+def _call_gemini_json(api_key: str, system_prompt: str, user_content: str) -> Dict[str, Any]:
+    """Chama o Gemini pelo SDK novo, forçando saída JSON."""
+    client = genai.Client(api_key=api_key)
 
-def _build_client(api_key: str) -> OpenAI:
-    # O SDK OpenAI cuida do header Authorization: Bearer <key> exigido pelo gateway.
-    return OpenAI(base_url=TEAMO_BASE_URL, api_key=api_key)
+    # Pequeno respiro para reduzir risco de estourar o rate limit (429) no free tier.
+    time.sleep(0.5)
 
-
-def _call_llm_json(api_key: str, system_prompt: str, user_content: str) -> Dict[str, Any]:
-    client = _build_client(api_key)
-
-    # Pequeno delay para respeitar o rate limit do plano free.
-    time.sleep(1)
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
-
-    # Tenta forçar saída JSON nativa; se o modelo/gateway não suportar, refaz sem o parâmetro.
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=user_content,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",  # força JSON válido
             temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-    except Exception:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.2,
-        )
-
-    return safe_json_loads(response.choices[0].message.content)
+        ),
+    )
+    return safe_json_loads(response.text)
 
 def analyze_batches(api_key: str, comments: List[Dict[str, Any]], batch_size: int) -> Tuple[List[Dict[str, Any]], List[str]]:
     resultados: List[Dict[str, Any]] = []
     avisos: List[str] = []
 
     batches = chunk_list(comments, batch_size)
-    progress = st.progress(0.0, text="Interpretando comentários com o DeepSeek…")
+    progress = st.progress(0.0, text="Interpretando comentários com o Gemini…")
 
     for i, batch in enumerate(batches):
         payload = json.dumps(batch, ensure_ascii=False)
         user_content = BATCH_INSTRUCTION + "\n\nComentários:\n" + payload
         try:
-            data = _call_llm_json(api_key, SYSTEM_PROMPT, user_content)
+            data = _call_gemini_json(api_key, SYSTEM_PROMPT, user_content)
             lote_res = data.get("resultados", [])
             if isinstance(lote_res, list):
                 resultados.extend(lote_res)
@@ -325,7 +307,7 @@ def analyze_batches(api_key: str, comments: List[Dict[str, Any]], batch_size: in
                 avisos.append(f"Lote {i + 1}: formato inesperado, ignorado.")
         except Exception as exc:
             avisos.append(f"Lote {i + 1}: falha na análise ({str(exc)}).")
-        progress.progress((i + 1) / len(batches), text="Interpretando comentários com o DeepSeek…")
+        progress.progress((i + 1) / len(batches), text="Interpretando comentários com o Gemini…")
 
     progress.empty()
     return resultados, avisos
@@ -342,10 +324,11 @@ def synthesize_insights(
         "amostra_comentarios": sample_comments,
     }
     user_content = SYNTHESIS_INSTRUCTION + "\n\nDados de contexto (JSON):\n" + json.dumps(context, ensure_ascii=False)
-    return _call_llm_json(api_key, SYSTEM_PROMPT, user_content)
+    return _call_gemini_json(api_key, SYSTEM_PROMPT, user_content)
 
 def safe_json_loads(content: Optional[str]) -> Dict[str, Any]:
-    if not content: raise ValueError("Resposta vazia da API.")
+    if not content:
+        raise ValueError("Resposta vazia da API.")
     content = content.strip()
     content = re.sub(r"^```(?:json)?", "", content).strip()
     content = re.sub(r"```$", "", content).strip()
@@ -354,8 +337,10 @@ def safe_json_loads(content: Optional[str]) -> Dict[str, Any]:
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", content, re.DOTALL)
         if match:
-            try: return json.loads(match.group(0))
-            except json.JSONDecodeError: pass
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
     raise ValueError("A API retornou um JSON inválido.")
 
 # ==========================================================
@@ -371,35 +356,47 @@ def aggregate_batch_results(df: pd.DataFrame, comment_results: List[Dict[str, An
     map_aspecto: Dict[int, str] = {}
 
     for res in comment_results:
-        if not isinstance(res, dict): continue
+        if not isinstance(res, dict):
+            continue
         cid = res.get("id")
         sent = str(res.get("sentimento_geral", "")).lower()
-        if sent in sentiment_counts: sentiment_counts[sent] += 1
-        if cid is not None: map_sentimento[cid] = sent or "n/d"
+        if sent in sentiment_counts:
+            sentiment_counts[sent] += 1
+        if cid is not None:
+            map_sentimento[cid] = sent or "n/d"
 
         aspectos = res.get("aspectos", []) or []
         aspecto_principal = None
         for a in aspectos:
-            if not isinstance(a, dict): continue
+            if not isinstance(a, dict):
+                continue
             nome = str(a.get("aspecto", "")).strip().lower()
-            if not nome: continue
+            if not nome:
+                continue
             asent = str(a.get("sentimento", "neutro")).lower()
             bucket = aspect_stats.setdefault(nome, {"mencoes": 0, "positivas": 0, "negativas": 0, "neutras": 0})
             bucket["mencoes"] += 1
-            if asent == "positivo": bucket["positivas"] += 1
-            elif asent == "negativo": bucket["negativas"] += 1
-            else: bucket["neutras"] += 1
-            if aspecto_principal is None: aspecto_principal = nome
-        if cid is not None: map_aspecto[cid] = aspecto_principal or "n/d"
+            if asent == "positivo":
+                bucket["positivas"] += 1
+            elif asent == "negativo":
+                bucket["negativas"] += 1
+            else:
+                bucket["neutras"] += 1
+            if aspecto_principal is None:
+                aspecto_principal = nome
+        if cid is not None:
+            map_aspecto[cid] = aspecto_principal or "n/d"
 
         marca = res.get("marca", {}) or {}
         if isinstance(marca, dict) and marca.get("mencionada"):
             msent = str(marca.get("sentimento", "neutro")).lower()
-            if msent in brand_mentions: brand_mentions[msent] += 1
+            if msent in brand_mentions:
+                brand_mentions[msent] += 1
 
         for b in res.get("comportamento", []) or []:
             key = str(b).lower().strip()
-            if key: behavior_counts[key] = behavior_counts.get(key, 0) + 1
+            if key:
+                behavior_counts[key] = behavior_counts.get(key, 0) + 1
 
     df["sentimento_ia"] = df.index.map(lambda i: map_sentimento.get(i, "n/d"))
     df["aspecto_principal"] = df.index.map(lambda i: map_aspecto.get(i, "n/d"))
@@ -419,9 +416,11 @@ def validate_synthesis(data: Dict[str, Any]) -> Dict[str, Any]:
         "marca": {"percepcao": "", "principais_pontos": [], "opiniao_publica_campanha": ""},
         "insights": [],
     }
-    if not isinstance(data, dict): return defaults
+    if not isinstance(data, dict):
+        return defaults
     for key, default in defaults.items():
-        if key not in data or data[key] is None: data[key] = default
+        if key not in data or data[key] is None:
+            data[key] = default
     return data
 
 # ==========================================================
@@ -450,45 +449,36 @@ def inject_design_system() -> None:
     #MainMenu, footer { visibility:hidden; }
     h1,h2,h3 { font-family:'Montserrat',sans-serif !important; letter-spacing:-.03em; }
     h2 { color:var(--choco) !important; }
-
     [data-testid="stFileUploader"] { background:#fff; border:2px dashed rgba(58,26,13,.45); border-radius:22px; padding:1rem; box-shadow:0 12px 35px rgba(63,33,19,.10); }
     [data-testid="stFileUploader"] label, [data-testid="stFileUploader"] p, [data-testid="stFileUploader"] span { color:#241006 !important; font-weight:600; font-size:1.02rem; }
     section[data-testid="stSidebar"] { background:#2A1208; }
     section[data-testid="stSidebar"] * { color:#FFF7E7 !important; }
-
     div[data-testid="stMetric"] { background:white; border:1px solid rgba(58,26,13,.14); border-radius:22px; padding:1.15rem 1.2rem; box-shadow:0 12px 30px rgba(63,33,19,.10); }
     div[data-testid="stMetricLabel"] { color:#3A2A20; font-weight:800; font-size:1rem; }
     div[data-testid="stMetricValue"] { color:var(--choco); font-family:'Montserrat',sans-serif; font-size:2.4rem; font-weight:900; }
-
     div[data-testid="stPlotlyChart"] { background:white; border:1px solid rgba(58,26,13,.14); border-radius:24px; padding:.55rem; box-shadow:0 14px 36px rgba(63,33,19,.10); overflow:hidden; }
     [data-testid="stDataFrame"] { border-radius:18px; overflow:hidden; border:1px solid rgba(58,26,13,.16); }
     .stButton>button { border:0; border-radius:999px; min-height:3.2rem; padding:0 1.7rem; font-weight:900; font-size:1.05rem; color:#231005; background:linear-gradient(135deg,#FFCE33,#F0AF00); box-shadow:0 10px 22px rgba(245,184,0,.35); transition:.2s ease; }
-
     .hero { position:relative; overflow:hidden; border-radius:34px; padding:3.2rem 3rem; color:white; background:linear-gradient(120deg,#1E0D04 0%,#3A1A0D 58%,#5A2C17 100%); box-shadow:0 24px 55px rgba(42,18,8,.28); margin-bottom:1.6rem; }
     .hero-kicker { display:inline-flex; border:1px solid rgba(255,255,255,.34); padding:.5rem .9rem; border-radius:999px; text-transform:uppercase; font-size:.82rem; font-weight:900; color:#FFD84D; letter-spacing:.04em; }
     .hero h1 { margin:.8rem 0 .45rem; font-size:clamp(2.6rem,5vw,4.9rem); line-height:.98; color:white !important; }
     .hero p { color:#FBEBD2 !important; font-size:1.18rem; font-weight:500; }
-
     .section-head { margin:2.3rem 0 .85rem; display:flex; gap:1rem; align-items:flex-end; justify-content:space-between; }
     .section-eyebrow { color:#8A4A00; text-transform:uppercase; font-weight:900; font-size:.86rem; letter-spacing:.06em; }
     .section-title { margin:.15rem 0 0; color:#241006; font-family:'Montserrat',sans-serif; font-size:2.1rem; font-weight:900; }
     .section-copy { color:#4A382E; font-size:1.02rem; font-weight:500; max-width:38ch; text-align:right; }
-
     .kpi-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:1rem; margin:.2rem 0 1.2rem; }
     .kpi { background:#fff; border-radius:24px; padding:1.35rem 1.3rem; box-shadow:0 14px 36px rgba(63,33,19,.10); border:1px solid rgba(58,26,13,.10); }
     .kpi-label { color:#3A2A20; font-size:.95rem; text-transform:uppercase; font-weight:900; letter-spacing:.03em; }
     .kpi-value { margin:.4rem 0 .18rem; font-family:'Montserrat',sans-serif; font-size:2.7rem; font-weight:900; color:#241006; line-height:1; }
     .kpi-note { color:#5A463C; font-size:.9rem; font-weight:600; }
-
     .panel { background:white; border-radius:24px; padding:1.5rem; margin-bottom:1rem; box-shadow:0 14px 36px rgba(63,33,19,.10); border:1px solid rgba(58,26,13,.10); }
     .panel p, .panel b, .panel strong { color:#241006 !important; font-size:1.05rem; }
-
     .ai-shell { padding:2px; border-radius:30px; background:linear-gradient(135deg,#F0AF00,#FFDF68 38%,#5A2C17); margin:1rem 0; }
     .ai-inner { border-radius:28px; padding:1.7rem; background:linear-gradient(145deg,#241006,#3A1A0D); color:white; }
     .ai-badge { color:#FFD84D; font-size:.82rem; text-transform:uppercase; font-weight:900; }
     .ai-title { color:white; font-family:'Montserrat',sans-serif; font-size:2.1rem; font-weight:900; margin:.25rem 0; }
     .ai-copy { color:#FBEBD2 !important; font-size:1.1rem; }
-
     .insight-card { background:white; border-radius:22px; padding:1.35rem; margin-bottom:1rem; box-shadow:0 12px 28px rgba(63,33,19,.10); border:1px solid rgba(58,26,13,.10); }
     .insight-title { color:#241006; font-family:'Montserrat',sans-serif; font-weight:900; font-size:1.25rem; margin-bottom:.75rem; }
     .insight-row { color:#2E2018; font-size:1.02rem; line-height:1.6; margin:.5rem 0; }
@@ -503,7 +493,6 @@ def section_header(eyebrow: str, title: str, copy: str = "") -> None:
     st.markdown(f"""<div class="section-head"><div><div class="section-eyebrow">{eyebrow}</div><div class="section-title">{title}</div></div><div class="section-copy">{copy}</div></div>""", unsafe_allow_html=True)
 
 def style_figure(fig: go.Figure, height: int = 440) -> go.Figure:
-    """Aplica tipografia grande e de alto contraste em todos os gráficos."""
     fig.update_layout(
         template="plotly_white", height=height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Manrope", color=INK, size=17),
@@ -570,7 +559,8 @@ def chart_sentiment_distribution(sentiment_counts: Dict[str, int]) -> go.Figure:
 
 def _aspect_bar(aspectos: List[Dict[str, Any]], key: str, title: str, color: str) -> Optional[go.Figure]:
     data=sorted([a for a in aspectos if a.get(key,0)>0],key=lambda a:a[key],reverse=True)[:8]
-    if not data:return None
+    if not data:
+        return None
     valores=[a[key] for a in data][::-1]
     nomes=[a["nome"].capitalize() for a in data][::-1]
     fig=go.Figure(go.Bar(
@@ -588,7 +578,8 @@ def chart_top_negative_aspects(aspectos): return _aspect_bar(aspectos,"negativas
 def chart_diverging_aspects(aspectos: List[Dict[str, Any]]) -> Optional[go.Figure]:
     data=sorted(aspectos,key=lambda a:a["mencoes"],reverse=True)[:8]
     data=[a for a in data if a["positivas"]+a["negativas"]>0]
-    if not data:return None
+    if not data:
+        return None
     names=[a["nome"].capitalize() for a in data][::-1]
     neg=[a["negativas"] for a in data][::-1]
     pos=[a["positivas"] for a in data][::-1]
@@ -641,7 +632,8 @@ def render_behavior_and_brand(synthesis, brand_counts):
     with c1:
         st.markdown('<div class="panel"><div class="section-eyebrow">Comportamento</div><div class="section-title">Sinais do consumidor</div>',unsafe_allow_html=True)
         comp=synthesis.get("comportamento",{})
-        for label,key in [("Recompra","recompra"),("Recomendação","recomendacao"),("Fidelidade","fidelidade")]: st.markdown(f"**{label}:** {comp.get(key,'—')}")
+        for label,key in [("Recompra","recompra"),("Recomendação","recomendacao"),("Fidelidade","fidelidade")]:
+            st.markdown(f"**{label}:** {comp.get(key,'—')}")
         st.markdown('</div>',unsafe_allow_html=True)
     with c2:
         st.markdown('<div class="panel"><div class="section-eyebrow">Marca & Campanha</div><div class="section-title">Percepção de Marketing</div>',unsafe_allow_html=True)
@@ -656,21 +648,23 @@ def render_behavior_and_brand(synthesis, brand_counts):
 
 def run_ai_analysis(api_key: str, df: pd.DataFrame, metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     comments = prepare_comments(df)
-    if not comments: return None
+    if not comments:
+        st.warning("Nenhum comentário válido para analisar após a limpeza do CSV.")
+        return None
 
     comment_results, avisos = analyze_batches(api_key, comments, BATCH_SIZE)
 
-    # Mostra os avisos/erros de lote para não falhar silenciosamente.
+    # Torna os erros VISÍVEIS (antes ficavam escondidos).
     if avisos:
-        with st.expander(f"⚠️ {len(avisos)} aviso(s) durante a análise dos lotes"):
+        with st.expander(f"⚠️ {len(avisos)} aviso(s) durante a análise — clique para ver detalhes"):
             for a in avisos:
                 st.write("• " + a)
 
     if not comment_results:
         st.error(
-            "Falha ao processar com a IA. Verifique: (1) sua TEAMOROUTER_API_KEY (deve começar com "
-            "'sk-teamo-'); (2) se o modelo 'deepseek-v4-pro-free' está disponível em GET /v1/models; "
-            "(3) o limite de uso do plano free (rate limit)."
+            "Falha ao processar com a IA. Verifique: (1) GEMINI_API_KEY, "
+            "(2) se o modelo está ativo (gemini-2.5-flash) e (3) limites do plano gratuito. "
+            "Os detalhes técnicos estão no expander de avisos acima."
         )
         return None
 
@@ -693,20 +687,29 @@ def run_ai_analysis(api_key: str, df: pd.DataFrame, metrics: Dict[str, Any]) -> 
 
 def main() -> None:
     inject_design_system()
-    st.markdown("""<div class="hero"><div class="hero-kicker">Consumer analytics · AI DeepSeek</div><h1>Consumer Insights — Nescau</h1><p>Extração automática de pontos fortes, fracos e opinião sobre campanhas de marketing.</p></div>""",unsafe_allow_html=True)
+    st.markdown("""<div class="hero"><div class="hero-kicker">Consumer analytics · AI Gemini</div><h1>Consumer Insights — Nescau</h1><p>Extração automática de pontos fortes, fracos e opinião sobre campanhas de marketing.</p></div>""",unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("⚙️ Configurações IA")
-        user_api_key = st.text_input("Cole aqui sua TeamoRouter API Key (sk-teamo-...):", type="password", help="Chave do gateway TeamoRouter")
-        st.caption(f"Modelo: `{MODEL_NAME}`")
+        user_api_key = st.text_input("Cole aqui sua Gemini API Key:", type="password", help="Pegue gratuitamente no Google AI Studio")
 
     api_key = user_api_key or get_api_key()
 
     uploaded=st.file_uploader("Envie o CSV (data, 1-5, comentario)",type=["csv"])
-    if uploaded is None: return
+    if uploaded is None:
+        return
 
     df_raw,load_err=load_data(uploaded)
-    if load_err: st.error(load_err); return
+    if load_err:
+        st.error(load_err); return
+
+    # Valida colunas ANTES de limpar (evita KeyError silencioso).
+    ok, msgs = validate_csv(df_raw)
+    if not ok:
+        for m in msgs:
+            st.error(m)
+        return
+
     df, quality = clean_dataframe(df_raw)
 
     metrics = compute_metrics(df)
@@ -722,14 +725,16 @@ def main() -> None:
     st.markdown('<div class="ai-shell"><div class="ai-inner"><div class="ai-title" style="color:#FFFFFF;">AI Consumer Insights</div><p class="ai-copy">Organiza e descobre o que os clientes acharam do produto e das campanhas.</p></div></div>',unsafe_allow_html=True)
 
     if not api_key:
-        st.error("👈 Por favor, cole sua chave do TeamoRouter no menu lateral para liberar as funções da IA.")
+        st.error("👈 Por favor, cole sua chave do Gemini no menu lateral para liberar as funções da IA.")
         return
 
-    if not st.button("Gerar análise inteligente com DeepSeek 🚀",use_container_width=False): return
+    if not st.button("Gerar análise inteligente com Gemini 🚀",use_container_width=False):
+        return
 
-    with st.spinner("Analisando com Inteligência Artificial (DeepSeek via TeamoRouter)..."):
+    with st.spinner("Analisando com Inteligência Artificial do Google..."):
         result=run_ai_analysis(api_key,df,metrics)
-    if result is None: return
+    if result is None:
+        return
 
     synthesis=result["synthesis"]; agg=result["aggregation"]; sentiment_counts=agg["sentiment_counts"]; aspectos=synthesis.get("aspectos") or agg["aspectos"]
 
@@ -760,3 +765,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
